@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"image/color"
 	"log"
 	"math"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -21,9 +23,11 @@ import (
 // events to total events. The results are plotted to a PNG file.
 func main() {
 	ctx := context.Background()
-	simDuration := 300         // seconds
-	simInterval := time.Second // per-second data aggregation
-	gpuMaxCapacity := 125      // maximum fps of GPU
+	simDuration := 30                        // simulation duration in seconds (adjust as needed)
+	simInterval := time.Second               // aggregate data per second
+	gpuMaxCapacity := 125                    // maximum fps (for reference in the graph)
+	numPods := 3                             // number of VA pipeline pods available
+	processingDelay := 10 * time.Millisecond // simulated processing delay per event
 
 	l := logrus.New()
 	l.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
@@ -33,52 +37,77 @@ func main() {
 		ctx,
 		logger,
 		"simLimiter",
-		1,
-		10.0,
-		1.0,
-		20.0,
-		0.5,
-		1.0)
+		125,   // capacity
+		75.0,  // initial refill rate tokens/sec
+		10.0,  // min rate
+		120.0, // max rate
+		4,     // adjust step
+		9,     // backoff step
+	)
 
-	// We'll simulate one-second buckets of events and adjust after each second.
-	// Using a sine wave to fluctuate event rate.
+	// Semaphore to simulate available VA pipeline pod slots.
+	// Only numPods events can be processed concurrently.
+	podSemaphore := make(chan struct{}, numPods)
+	// Pre-fill semaphore with numPods tokens.
+	for i := 0; i < numPods; i++ {
+		podSemaphore <- struct{}{}
+	}
+
+	// Sine wave parameters for varying event rate.
 	baseline := 50.0
 	amplitude := 100.0
-	period := 60.0 // one minute period
+	period := 60.0 // period in seconds
 
 	var mu sync.Mutex
-	// Slices to hold per-second simulation data.
 	var seconds []float64
 	var totalEventsArr []float64
 	var inferencedEventsArr []float64
 	var maxCapacityArr []float64
 
 	log.Println("Starting simulation...")
-	startTime := time.Now()
+	simStart := time.Now()
+	// For each simulation second, generate events and process them concurrently.
 	for t := 0; t < simDuration; t++ {
-		// Calculate events per second.
 		avgEvents := baseline + amplitude*math.Sin(2*math.Pi*float64(t)/period)
 		eventsThisSecond := int(math.Max(avgEvents, 0))
 		totalEvents := eventsThisSecond
 		inferenced := 0
 
-		// Process each event through the rate limiter.
+		var wg sync.WaitGroup
+		// Dispatch events concurrently.
 		for i := 0; i < eventsThisSecond; i++ {
-			ok := rateLimiter.Wait("basic", 20*time.Millisecond)
-			if ok {
-				inferenced++
-			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Acquire a pod slot.
+				<-podSemaphore
+				// Ensure to release pod slot when done.
+				defer func() {
+					podSemaphore <- struct{}{}
+				}()
+				// Wait for token availability with a timeout.
+				ok := rateLimiter.Wait("basic", 20*time.Millisecond)
+				if ok {
+					// Simulate processing (for example, inference delay).
+					time.Sleep(processingDelay + time.Duration(rand.Intn(5))*time.Millisecond)
+					// Count as a successfully processed (inferenced) event.
+					mu.Lock()
+					inferenced++
+					mu.Unlock()
+				}
+			}()
 		}
+		wg.Wait()
 
-		// Adaptive adjustment.
+		// Adaptive rate adjustment based on ratio of inferenced events.
 		ratio := float64(inferenced) / float64(totalEvents)
-		if ratio < 0.8 {
-			rateLimiter.ReduceRate()
-		} else if ratio > 0.95 {
+		if ratio > 0.9 {
 			rateLimiter.IncreaseRate()
+		} else {
+			rateLimiter.ReduceRate()
 		}
 
-		// Save per-second data.
+		// Save per-second metrics.
 		mu.Lock()
 		seconds = append(seconds, float64(t))
 		totalEventsArr = append(totalEventsArr, float64(totalEvents))
@@ -86,18 +115,13 @@ func main() {
 		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacity))
 		mu.Unlock()
 
-		// Print progress every 10 seconds
-		if t%10 == 0 {
-			log.Printf("Simulation progress: %d/%d seconds", t, simDuration)
-		}
-
-		// Sleep to simulate a real second.
+		log.Printf("Second %d: Total events = %d, Inferenced = %d, Current Rate: %.2f",
+			t, totalEvents, inferenced, rateLimiter.GetRate())
 		time.Sleep(simInterval)
 	}
-	elapsed := time.Since(startTime)
+	elapsed := time.Since(simStart)
 	log.Printf("Simulation complete in %v", elapsed)
 
-	// Plot the results using Gonum/plot.
 	err := plotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr)
 	if err != nil {
 		log.Fatalf("Error plotting results: %v", err)
@@ -161,7 +185,8 @@ func plotResults(x, total, inferenced, capacity []float64) error {
 
 	p.Legend.Top = true
 
-	if err := p.Save(8*vg.Inch, 4*vg.Inch, "./output/simulation_results.png"); err != nil {
+	timestamp := time.Now().Format(time.RFC3339)
+	if err := p.Save(8*vg.Inch, 4*vg.Inch, fmt.Sprintf("./output/simulation_results_%s.png", timestamp)); err != nil {
 		return err
 	}
 	return nil
