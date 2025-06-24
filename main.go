@@ -161,7 +161,7 @@ func plotResults(x, total, inferenced, capacity []float64) error {
 
 	p.Legend.Top = true
 
-	if err := p.Save(8*vg.Inch, 4*vg.Inch, "simulation_results.png"); err != nil {
+	if err := p.Save(8*vg.Inch, 4*vg.Inch, "./output/simulation_results.png"); err != nil {
 		return err
 	}
 	return nil
