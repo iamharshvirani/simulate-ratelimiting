@@ -12,7 +12,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
-	"gonum.org/v1/plot/plotutil"
 	"gonum.org/v1/plot/vg"
 )
 
@@ -22,7 +21,7 @@ import (
 // events to total events. The results are plotted to a PNG file.
 func main() {
 	ctx := context.Background()
-	simDuration := 5           // seconds
+	simDuration := 300         // seconds
 	simInterval := time.Second // per-second data aggregation
 	gpuMaxCapacity := 125      // maximum fps of GPU
 
@@ -106,14 +105,13 @@ func main() {
 	log.Println("Graph generated: simulation_results.png")
 }
 
-// plotResults creates a graph with three lines: maximum capacity, total events, and successfully inferenced events.
+// plotResults plots three lines: GPU capacity, total events per second, and inferenced events per second.
 func plotResults(x, total, inferenced, capacity []float64) error {
 	p := plot.New()
 	p.Title.Text = "Dynamic Rate Limiter Simulation Results"
 	p.X.Label.Text = "Time (seconds)"
 	p.Y.Label.Text = "Events per Second"
 
-	// Create plotter.XYs for each line.
 	totalPoints := make(plotter.XYs, len(x))
 	inferencedPoints := make(plotter.XYs, len(x))
 	capacityPoints := make(plotter.XYs, len(x))
@@ -126,22 +124,43 @@ func plotResults(x, total, inferenced, capacity []float64) error {
 		capacityPoints[i].Y = capacity[i]
 	}
 
-	err := plotutil.AddLinePoints(p,
-		"Total Events", totalPoints,
-		"Inferenced Events", inferencedPoints,
-		"GPU Capacity", capacityPoints)
+	// Define custom colors.
+	blue := color.RGBA{R: 0, G: 0, B: 255, A: 255}
+	yellow := color.RGBA{R: 255, G: 255, B: 0, A: 255}
+	green := color.RGBA{R: 0, G: 128, B: 0, A: 255}
+
+	// Plot GPU Capacity (blue).
+	capacityLine, err := plotter.NewLine(capacityPoints)
 	if err != nil {
 		return err
 	}
+	capacityLine.LineStyle.Width = vg.Points(2)
+	capacityLine.LineStyle.Color = blue
+	p.Add(capacityLine)
+	p.Legend.Add("GPU Capacity", capacityLine)
 
-	// Customize GPU capacity line style: dashed red line.
-	if lp, err := plotter.NewLine(capacityPoints); err == nil {
-		lp.LineStyle.Color = color.RGBA{R: 255, A: 255}
-		lp.LineStyle.Dashes = []vg.Length{5, 5}
-		p.Add(lp)
+	// Plot Total Events (yellow).
+	totalLine, err := plotter.NewLine(totalPoints)
+	if err != nil {
+		return err
 	}
+	totalLine.LineStyle.Width = vg.Points(2)
+	totalLine.LineStyle.Color = yellow
+	p.Add(totalLine)
+	p.Legend.Add("Total Events", totalLine)
 
-	// Save the plot as a PNG file.
+	// Plot Inferenced Events (green).
+	inferencedLine, err := plotter.NewLine(inferencedPoints)
+	if err != nil {
+		return err
+	}
+	inferencedLine.LineStyle.Width = vg.Points(2)
+	inferencedLine.LineStyle.Color = green
+	p.Add(inferencedLine)
+	p.Legend.Add("Inferenced Events", inferencedLine)
+
+	p.Legend.Top = true
+
 	if err := p.Save(8*vg.Inch, 4*vg.Inch, "simulation_results.png"); err != nil {
 		return err
 	}
