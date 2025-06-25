@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -13,35 +14,233 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// VAPipelineSimulator remains the same.
-type VAPipelineSimulator struct {
+// VAPipelinePod simulates a VA Pipeline pod with its own capacity
+type VAPipelinePod struct {
 	mu               sync.Mutex
+	id               string
 	capacityPerSec   int
 	processedThisSec int
 	lastTick         time.Time
+	rateLimiter      ratelimiter.DynamicRateLimiter
 }
 
-func NewVAPipelineSimulator(capacity int) *VAPipelineSimulator {
-	return &VAPipelineSimulator{
+func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *ratelimiter.SimpleLogger) *VAPipelinePod {
+	return &VAPipelinePod{
+		id:             id,
 		capacityPerSec: capacity,
 		lastTick:       time.Now(),
+		rateLimiter: ratelimiter.NewDynamicRateLimiter(
+			ctx,
+			logger,
+			"pod_"+id,
+			125,   // capacity
+			100.0, // initial rate
+			30.0,  // min rate
+			150.0, // max rate
+			50,    // adjust step
+			30,    // backoff step
+
+			// 125,   // capacity (bucket size)
+			// 100.0, // initial refill rate tokens/sec
+			// 30.0,  // min rate
+			// 150.0, // max rate
+			// 16,    // adjust step
+			// 20,    // backoff step
+		),
 	}
 }
 
-func (s *VAPipelineSimulator) Process() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (p *VAPipelinePod) Process() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	if time.Since(s.lastTick) >= time.Second {
-		s.lastTick = time.Now()
-		s.processedThisSec = 0
+	if time.Since(p.lastTick) >= time.Second {
+		p.lastTick = time.Now()
+		p.processedThisSec = 0
 	}
 
-	if s.processedThisSec < s.capacityPerSec {
-		s.processedThisSec++
+	if p.processedThisSec < p.capacityPerSec {
+		p.processedThisSec++
 		return true
 	}
 	return false
+}
+
+// PipelineCluster manages multiple VA Pipeline pods
+type PipelineCluster struct {
+	pods []*VAPipelinePod
+}
+
+func NewPipelineCluster(numPods int, capacityPerPod int, ctx context.Context, logger *ratelimiter.SimpleLogger) *PipelineCluster {
+	cluster := &PipelineCluster{
+		pods: make([]*VAPipelinePod, numPods),
+	}
+	for i := 0; i < numPods; i++ {
+		cluster.pods[i] = NewVAPipelinePod(fmt.Sprintf("pod-%d", i), capacityPerPod, ctx, logger)
+	}
+	return cluster
+}
+
+func (c *PipelineCluster) GetPod(cameraId string) *VAPipelinePod {
+	podIndex := int(cameraHash(cameraId)) % len(c.pods)
+	return c.pods[podIndex]
+}
+
+// Hash function for camera ID distribution
+func cameraHash(cameraId string) uint32 {
+	h := uint32(0)
+	for i := 0; i < len(cameraId); i++ {
+		h = h*31 + uint32(cameraId[i])
+	}
+	return h
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	simDuration := 120          // seconds
+	numPods := 2                // number of VA Pipeline pods
+	gpuMaxCapacityPerPod := 125 // 125/3 ≈ 42 per pod
+	numWorkers := 200           // worker pool size
+	processingDelay := 10 * time.Millisecond
+
+	l := logrus.New()
+	l.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+	logger := &ratelimiter.SimpleLogger{SimpleLogger: l}
+
+	cluster := NewPipelineCluster(numPods, gpuMaxCapacityPerPod, ctx, logger)
+
+	requestChan := make(chan struct {
+		cameraId  string
+		timestamp time.Time
+	}, numWorkers)
+	metricsChan := make(chan secondMetrics, simDuration)
+
+	// Start worker pool
+	var workerWg sync.WaitGroup
+	workerWg.Add(numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case req, ok := <-requestChan:
+					if !ok {
+						return
+					}
+
+					// Get the pod for this camera (simulating sticky routing)
+					pod := cluster.GetPod(req.cameraId)
+
+					// Try to get rate limiter token
+					if !pod.rateLimiter.Wait("basic", 50*time.Millisecond) {
+						continue
+					}
+
+					// Simulate processing
+					time.Sleep(processingDelay + time.Duration(rand.Intn(5))*time.Millisecond)
+
+					// Try to process on the pod
+					if pod.Process() {
+						pod.rateLimiter.LogSuccess()
+					} else {
+						pod.rateLimiter.LogFailure()
+					}
+				}
+			}
+		}()
+	}
+
+	// Start event generation and metrics collection
+	log.Println("Starting simulation...")
+	go func() {
+		var producerWg sync.WaitGroup
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for t := 0; t < simDuration; t++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				eventsThisSecond := generateLoad(t, 80.0, 60.0, 90.0, 30, 45, 3.0)
+
+				// Generate camera IDs and dispatch events
+				if eventsThisSecond > 0 {
+					interval := time.Second / time.Duration(eventsThisSecond)
+					producerWg.Add(1)
+					go func(numEvents int, ivl time.Duration) {
+						defer producerWg.Done()
+						for i := 0; i < numEvents; i++ {
+							cameraId := fmt.Sprintf("cam_%d", rand.Intn(1000))
+							requestChan <- struct {
+								cameraId  string
+								timestamp time.Time
+							}{cameraId, time.Now()}
+							time.Sleep(ivl)
+						}
+					}(eventsThisSecond, interval)
+				}
+
+				// Collect metrics from all pods
+				var totalProcessed int
+				var totalRate float64
+				for _, pod := range cluster.pods {
+					pod.mu.Lock()
+					processed := pod.processedThisSec
+					rate := pod.rateLimiter.GetRate()
+					pod.mu.Unlock()
+
+					totalProcessed += processed
+					totalRate += rate
+				}
+
+				// log.Printf("Second %d: Target=%d, Processed=%d, AvgRate=%.2f",
+				// 	t, eventsThisSecond, totalProcessed, totalRate/float64(numPods))
+
+				log.Printf("Second %d: Target Load=%-4d | totalProcessed=%d | Rate: %.2f",
+					t, eventsThisSecond, totalProcessed, totalRate/float64(numPods))
+
+				metricsChan <- secondMetrics{
+					totalEvents:      eventsThisSecond,
+					inferencedEvents: totalProcessed,
+					finalRate:        totalRate / float64(numPods),
+				}
+			}
+		}
+		producerWg.Wait()
+		close(requestChan)
+		close(metricsChan)
+	}()
+
+	// Collect and plot results
+	var allMetrics []secondMetrics
+	for m := range metricsChan {
+		allMetrics = append(allMetrics, m)
+	}
+
+	workerWg.Wait()
+	log.Println("Simulation complete.")
+
+	// Prepare plotting data
+	var seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr []float64
+	for i, m := range allMetrics {
+		seconds = append(seconds, float64(i))
+		totalEventsArr = append(totalEventsArr, float64(m.totalEvents))
+		inferencedEventsArr = append(inferencedEventsArr, float64(m.inferencedEvents))
+		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacityPerPod*numPods))
+		rateArr = append(rateArr, m.finalRate)
+	}
+
+	err := plotmetrics.PlotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr)
+	if err != nil {
+		log.Fatalf("Error plotting results: %v", err)
+	}
+	log.Println("Graph generated.")
 }
 
 func generateLoad(second int, baseline, amplitude, period float64, jitterPercent int, peakSecond int, peakMultiplier float64) int {
@@ -54,164 +253,10 @@ func generateLoad(second int, baseline, amplitude, period float64, jitterPercent
 	return int(math.Max(loadWithJitter, 0))
 }
 
-// Struct to hold results for each second.
 type secondMetrics struct {
 	totalEvents          int
 	inferencedEvents     int
 	droppedByRateLimiter int
 	droppedByPipeline    int
 	finalRate            float64
-}
-
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// --- Simulation Parameters ---
-	simDuration := 120
-	gpuMaxCapacity := 125
-	processingDelay := 10 * time.Millisecond
-	numWorkers := 200 // A pool of workers to process requests.
-
-	l := logrus.New()
-	l.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-	logger := &ratelimiter.SimpleLogger{SimpleLogger: l}
-
-	rateLimiter := ratelimiter.NewDynamicRateLimiter(
-		ctx,
-		logger,
-		"simLimiter",
-		125,   // capacity (bucket size)
-		100.0, // initial refill rate tokens/sec
-		30.0,  // min rate
-		150.0, // max rate
-		16,    // adjust step
-		20,    // backoff step
-	)
-
-	pipeline := NewVAPipelineSimulator(gpuMaxCapacity)
-	requestChan := make(chan struct{}, numWorkers) // Channel for incoming requests
-	metricsChan := make(chan secondMetrics, simDuration)
-
-	var workerWg sync.WaitGroup
-
-	// --- Start Worker Pool ---
-	workerWg.Add(numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		go func() {
-			defer workerWg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case _, ok := <-requestChan:
-					if !ok {
-						return
-					}
-
-					// This logic is now executed by each worker.
-					if !rateLimiter.Wait("basic", 20*time.Millisecond) {
-						// Dropped by our own rate limiter
-						continue
-					}
-					time.Sleep(processingDelay)
-					if pipeline.Process() {
-						rateLimiter.LogSuccess()
-					} else {
-						rateLimiter.LogFailure() // "429" signal
-					}
-				}
-			}
-		}()
-	}
-
-	// --- Start Producer and Metrics Collector ---
-	log.Println("Starting simulation...")
-	go func() {
-		// This goroutine produces events and collects metrics each second.
-		var producerWg sync.WaitGroup // WaitGroup for drip-feed goroutines
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-
-		for t := 0; t < simDuration; t++ {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// --- Producer Logic ---
-				eventsThisSecond := generateLoad(t, 80.0, 60.0, 90.0, 30, 45, 3.0)
-
-				// Drip-feed events into the channel over one second.
-				if eventsThisSecond > 0 {
-					interval := time.Second / time.Duration(eventsThisSecond)
-					producerWg.Add(1)
-					go func(numEvents int, ivl time.Duration) {
-						defer producerWg.Done()
-						eventTicker := time.NewTicker(ivl)
-						defer eventTicker.Stop()
-						for j := 0; j < numEvents; j++ {
-							select {
-							case requestChan <- struct{}{}:
-							case <-ctx.Done():
-								return
-							}
-							// Also check for context done while waiting for the ticker
-							// to prevent goroutine leaks.
-							select {
-							case <-eventTicker.C:
-							case <-ctx.Done():
-								return
-							}
-						}
-					}(eventsThisSecond, interval)
-				}
-
-				// --- Metrics Collector Logic ---
-				// To get accurate metrics, we can peek into the pipeline simulator.
-				// This is a simplification for the simulation.
-				pipeline.mu.Lock()
-				inferenced := pipeline.processedThisSec
-				pipeline.mu.Unlock()
-
-				// Calculating drops is harder now. We log the state instead.
-				log.Printf("Second %d: Target Load=%-4d | Inferenced (approx)=%-4d | Rate: %.2f",
-					t, eventsThisSecond, inferenced, rateLimiter.GetRate())
-
-				metricsChan <- secondMetrics{
-					totalEvents:      eventsThisSecond,
-					inferencedEvents: inferenced,
-					finalRate:        rateLimiter.GetRate(),
-				}
-			}
-		}
-		// Wait for all event-producing goroutines to finish before closing channels.
-		producerWg.Wait()
-		close(requestChan) // Signal workers to stop
-		close(metricsChan)
-	}()
-
-	// --- Wait for results ---
-	var allMetrics []secondMetrics
-	for sm := range metricsChan {
-		allMetrics = append(allMetrics, sm)
-	}
-
-	workerWg.Wait() // Wait for all workers to finish
-	log.Println("Simulation complete.")
-
-	// --- Plotting ---
-	var seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr []float64
-	for i, m := range allMetrics {
-		seconds = append(seconds, float64(i))
-		totalEventsArr = append(totalEventsArr, float64(m.totalEvents))
-		inferencedEventsArr = append(inferencedEventsArr, float64(m.inferencedEvents))
-		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacity))
-		rateArr = append(rateArr, m.finalRate)
-	}
-
-	err := plotmetrics.PlotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr)
-	if err != nil {
-		log.Fatalf("Error plotting results: %v", err)
-	}
-	log.Println("Graph generated.")
 }
