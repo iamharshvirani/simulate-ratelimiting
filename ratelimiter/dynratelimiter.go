@@ -18,22 +18,21 @@ func (sl *SimpleLogger) Infoxf(_ interface{}, format string, a ...interface{}) {
 
 // DynamicRateLimiter defines an adaptive token bucket rate limiter.
 type DynamicRateLimiter interface {
-	// Wait blocks until a token is available.
-	// For premium accounts, it waits indefinitely.
-	// For basic accounts, it waits up to the provided timeout.
 	Wait(accountType string, timeout time.Duration) bool
-	Reduce()
-	IncreaseRate()
-	ReduceRate()
+	LogSuccess()
+	LogFailure()
 	GetRate() float64
+	// Reduce is kept for compatibility with the original interface if needed,
+	// but LogFailure is preferred.
+	Reduce()
 }
 
-// DynamicRateLimiter defines an adaptive token bucket rate limiter.
+// dynamicRateLimiter defines an adaptive token bucket rate limiter.
 type dynamicRateLimiter struct {
 	ctx         context.Context
-	log         *logrus.Logger
+	log         *SimpleLogger
 	name        string
-	capacity    int     // maximum tokens (usually 1 for our case)
+	capacity    int     // maximum tokens
 	tokens      int     // current tokens available
 	refillRate  float64 // tokens per second; dynamic value
 	lastRefill  time.Time
@@ -42,21 +41,30 @@ type dynamicRateLimiter struct {
 	adjustStep  float64 // incremental step for increasing rate
 	backoffStep float64 // decrement step for reducing rate
 	mu          sync.Mutex
+
+	// New fields for smarter adjustments
+	successCount     int // Consecutive successes
+	failureCount     int // Consecutive failures
+	successThreshold int // Increase rate after this many successes
+	failureThreshold int // Reduce rate after this many failures
 }
 
 // NewDynamicRateLimiter creates an instance with initial parameters.
 func NewDynamicRateLimiter(ctx context.Context, log *SimpleLogger, name string, capacity int, initialRate, minRate, maxRate, adjustStep, backoffStep float64) *dynamicRateLimiter {
 	return &dynamicRateLimiter{
-		ctx:         ctx,
-		name:        name,
-		capacity:    capacity,
-		tokens:      capacity, // start with a full bucket
-		refillRate:  initialRate,
-		minRate:     minRate,
-		maxRate:     maxRate,
-		adjustStep:  adjustStep,
-		backoffStep: backoffStep,
-		lastRefill:  time.Now(),
+		ctx:              ctx,
+		log:              log,
+		name:             name,
+		capacity:         capacity,
+		tokens:           capacity, // start with a full bucket
+		refillRate:       initialRate,
+		minRate:          minRate,
+		maxRate:          maxRate,
+		adjustStep:       adjustStep,
+		backoffStep:      backoffStep,
+		lastRefill:       time.Now(),
+		successThreshold: 3, // Increase rate after just 3 successes
+		failureThreshold: 5, // Tolerate up to 5 failures before reducing rate
 	}
 }
 
@@ -75,12 +83,9 @@ func (drl *dynamicRateLimiter) refill() {
 }
 
 // Wait blocks until a token is available.
-// For "premium" accounts, it waits indefinitely.
-// For "basic" accounts, it waits up to the specified timeout and returns false if it times out.
 func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) bool {
 	start := time.Now()
 	for {
-		// Check for cancellation
 		select {
 		case <-drl.ctx.Done():
 			return false
@@ -96,46 +101,69 @@ func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) b
 		}
 		drl.mu.Unlock()
 
-		// For basic accounts, check if we've exceeded our wait timeout.
 		if accountType == "basic" && time.Since(start) >= timeout {
 			return false
 		}
-		// Premium accounts or still within timeout: sleep briefly and try again.
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// Reduce pushes a skip signal. In this dynamic limiter, we delegate overload handling
-// to ReduceRate(), so we can simply call that method.
+// Reduce provides a direct way to signal overload, delegating to LogFailure.
 func (drl *dynamicRateLimiter) Reduce() {
-	drl.ReduceRate()
+	drl.LogFailure()
 }
 
-// IncreaseRate should be called upon successful calls (2xx and low latency)
-// to gradually increase the refill rate up to maxRate.
-func (drl *dynamicRateLimiter) IncreaseRate() {
-	drl.mu.Lock()
-	defer drl.mu.Unlock()
+// increaseRate contains the logic to increase the refill rate.
+func (drl *dynamicRateLimiter) increaseRate() {
 	newRate := drl.refillRate + drl.adjustStep
 	if newRate > drl.maxRate {
 		newRate = drl.maxRate
 	}
 	if newRate != drl.refillRate {
 		drl.refillRate = newRate
+		drl.log.Infoxf(nil, "Rate increased to %.2f", newRate)
 	}
 }
 
-// ReduceRate is called on overload (e.g., after 429 responses)
-// to lower the refill rate down to minRate.
-func (drl *dynamicRateLimiter) ReduceRate() {
-	drl.mu.Lock()
-	defer drl.mu.Unlock()
+// reduceRate contains the logic to lower the refill rate.
+func (drl *dynamicRateLimiter) reduceRate() {
 	newRate := drl.refillRate - drl.backoffStep
 	if newRate < drl.minRate {
 		newRate = drl.minRate
 	}
 	if newRate != drl.refillRate {
 		drl.refillRate = newRate
+		drl.log.Infoxf(nil, "Rate reduced to %.2f", newRate)
+	}
+}
+
+// LogSuccess is called upon successful calls.
+func (drl *dynamicRateLimiter) LogSuccess() {
+	drl.mu.Lock()
+	defer drl.mu.Unlock()
+
+	drl.failureCount = 0 // Reset failure count on success
+	drl.successCount++
+
+	if drl.successCount >= drl.successThreshold {
+		drl.increaseRate()
+		drl.successCount = 0 // Reset after increasing
+	}
+}
+
+// LogFailure is called on overload (e.g., after 429 responses).
+func (drl *dynamicRateLimiter) LogFailure() {
+	drl.mu.Lock()
+	defer drl.mu.Unlock()
+
+	drl.successCount = 0 // Reset success count on failure
+	drl.failureCount++
+
+	if drl.failureCount >= drl.failureThreshold {
+		drl.reduceRate()
+		// We can keep the failure count high to prevent immediate rate increases
+		// or reset it to start the count again. Let's reset it.
+		// drl.failureCount = 0
 	}
 }
 

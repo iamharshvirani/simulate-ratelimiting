@@ -2,32 +2,76 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"image/color"
 	"log"
 	"math"
 	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/iamharshvirani/simulate-ratelimiting/plotmetrics"
 	"github.com/iamharshvirani/simulate-ratelimiting/ratelimiter"
 	"github.com/sirupsen/logrus"
-	"gonum.org/v1/plot"
-	"gonum.org/v1/plot/plotter"
-	"gonum.org/v1/plot/vg"
 )
 
-// main runs a simulation of the DynamicRateLimiter to demonstrate its behavior and
-// plot the results. It simulates a sine wave of events per second, and after each
-// second, it adjusts the rate limiter based on the ratio of successfully inferenced
-// events to total events. The results are plotted to a PNG file.
+// VAPipelineSimulator remains the same.
+type VAPipelineSimulator struct {
+	mu               sync.Mutex
+	capacityPerSec   int
+	processedThisSec int
+	lastTick         time.Time
+}
+
+func NewVAPipelineSimulator(capacity int) *VAPipelineSimulator {
+	return &VAPipelineSimulator{
+		capacityPerSec: capacity,
+		lastTick:       time.Now(),
+	}
+}
+
+func (s *VAPipelineSimulator) Process() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if time.Since(s.lastTick) >= time.Second {
+		s.lastTick = time.Now()
+		s.processedThisSec = 0
+	}
+
+	if s.processedThisSec < s.capacityPerSec {
+		s.processedThisSec++
+		return true
+	}
+	return false
+}
+
+func generateLoad(second int, baseline, amplitude, period float64, jitterPercent int, peakSecond int, peakMultiplier float64) int {
+	baseLoad := baseline + amplitude*math.Sin(2*math.Pi*float64(second)/period)
+	jitter := (rand.Float64() - 0.5) * (float64(jitterPercent) / 100.0) * baseLoad
+	loadWithJitter := baseLoad + jitter
+	if second == peakSecond {
+		loadWithJitter *= peakMultiplier
+	}
+	return int(math.Max(loadWithJitter, 0))
+}
+
+// Struct to hold results for each second.
+type secondMetrics struct {
+	totalEvents          int
+	inferencedEvents     int
+	droppedByRateLimiter int
+	droppedByPipeline    int
+	finalRate            float64
+}
+
 func main() {
-	ctx := context.Background()
-	simDuration := 30                        // simulation duration in seconds (adjust as needed)
-	simInterval := time.Second               // aggregate data per second
-	gpuMaxCapacity := 125                    // maximum fps (for reference in the graph)
-	numPods := 3                             // number of VA pipeline pods available
-	processingDelay := 10 * time.Millisecond // simulated processing delay per event
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// --- Simulation Parameters ---
+	simDuration := 120
+	gpuMaxCapacity := 125
+	processingDelay := 10 * time.Millisecond
+	numWorkers := 200 // A pool of workers to process requests.
 
 	l := logrus.New()
 	l.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
@@ -37,157 +81,137 @@ func main() {
 		ctx,
 		logger,
 		"simLimiter",
-		125,   // capacity
-		75.0,  // initial refill rate tokens/sec
-		10.0,  // min rate
-		120.0, // max rate
-		4,     // adjust step
-		9,     // backoff step
+		125,   // capacity (bucket size)
+		100.0, // initial refill rate tokens/sec
+		30.0,  // min rate
+		150.0, // max rate
+		16,    // adjust step
+		20,    // backoff step
 	)
 
-	// Semaphore to simulate available VA pipeline pod slots.
-	// Only numPods events can be processed concurrently.
-	podSemaphore := make(chan struct{}, numPods)
-	// Pre-fill semaphore with numPods tokens.
-	for i := 0; i < numPods; i++ {
-		podSemaphore <- struct{}{}
-	}
+	pipeline := NewVAPipelineSimulator(gpuMaxCapacity)
+	requestChan := make(chan struct{}, numWorkers) // Channel for incoming requests
+	metricsChan := make(chan secondMetrics, simDuration)
 
-	// Sine wave parameters for varying event rate.
-	baseline := 50.0
-	amplitude := 100.0
-	period := 60.0 // period in seconds
+	var workerWg sync.WaitGroup
 
-	var mu sync.Mutex
-	var seconds []float64
-	var totalEventsArr []float64
-	var inferencedEventsArr []float64
-	var maxCapacityArr []float64
+	// --- Start Worker Pool ---
+	workerWg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case _, ok := <-requestChan:
+					if !ok {
+						return
+					}
 
-	log.Println("Starting simulation...")
-	simStart := time.Now()
-	// For each simulation second, generate events and process them concurrently.
-	for t := 0; t < simDuration; t++ {
-		avgEvents := baseline + amplitude*math.Sin(2*math.Pi*float64(t)/period)
-		eventsThisSecond := int(math.Max(avgEvents, 0))
-		totalEvents := eventsThisSecond
-		inferenced := 0
-
-		var wg sync.WaitGroup
-		// Dispatch events concurrently.
-		for i := 0; i < eventsThisSecond; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				// Acquire a pod slot.
-				<-podSemaphore
-				// Ensure to release pod slot when done.
-				defer func() {
-					podSemaphore <- struct{}{}
-				}()
-				// Wait for token availability with a timeout.
-				ok := rateLimiter.Wait("basic", 20*time.Millisecond)
-				if ok {
-					// Simulate processing (for example, inference delay).
-					time.Sleep(processingDelay + time.Duration(rand.Intn(5))*time.Millisecond)
-					// Count as a successfully processed (inferenced) event.
-					mu.Lock()
-					inferenced++
-					mu.Unlock()
+					// This logic is now executed by each worker.
+					if !rateLimiter.Wait("basic", 20*time.Millisecond) {
+						// Dropped by our own rate limiter
+						continue
+					}
+					time.Sleep(processingDelay)
+					if pipeline.Process() {
+						rateLimiter.LogSuccess()
+					} else {
+						rateLimiter.LogFailure() // "429" signal
+					}
 				}
-			}()
-		}
-		wg.Wait()
-
-		// Adaptive rate adjustment based on ratio of inferenced events.
-		ratio := float64(inferenced) / float64(totalEvents)
-		if ratio > 0.9 {
-			rateLimiter.IncreaseRate()
-		} else {
-			rateLimiter.ReduceRate()
-		}
-
-		// Save per-second metrics.
-		mu.Lock()
-		seconds = append(seconds, float64(t))
-		totalEventsArr = append(totalEventsArr, float64(totalEvents))
-		inferencedEventsArr = append(inferencedEventsArr, float64(inferenced))
-		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacity))
-		mu.Unlock()
-
-		log.Printf("Second %d: Total events = %d, Inferenced = %d, Current Rate: %.2f",
-			t, totalEvents, inferenced, rateLimiter.GetRate())
-		time.Sleep(simInterval)
+			}
+		}()
 	}
-	elapsed := time.Since(simStart)
-	log.Printf("Simulation complete in %v", elapsed)
 
-	err := plotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr)
+	// --- Start Producer and Metrics Collector ---
+	log.Println("Starting simulation...")
+	go func() {
+		// This goroutine produces events and collects metrics each second.
+		var producerWg sync.WaitGroup // WaitGroup for drip-feed goroutines
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for t := 0; t < simDuration; t++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// --- Producer Logic ---
+				eventsThisSecond := generateLoad(t, 80.0, 60.0, 90.0, 30, 45, 3.0)
+
+				// Drip-feed events into the channel over one second.
+				if eventsThisSecond > 0 {
+					interval := time.Second / time.Duration(eventsThisSecond)
+					producerWg.Add(1)
+					go func(numEvents int, ivl time.Duration) {
+						defer producerWg.Done()
+						eventTicker := time.NewTicker(ivl)
+						defer eventTicker.Stop()
+						for j := 0; j < numEvents; j++ {
+							select {
+							case requestChan <- struct{}{}:
+							case <-ctx.Done():
+								return
+							}
+							// Also check for context done while waiting for the ticker
+							// to prevent goroutine leaks.
+							select {
+							case <-eventTicker.C:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}(eventsThisSecond, interval)
+				}
+
+				// --- Metrics Collector Logic ---
+				// To get accurate metrics, we can peek into the pipeline simulator.
+				// This is a simplification for the simulation.
+				pipeline.mu.Lock()
+				inferenced := pipeline.processedThisSec
+				pipeline.mu.Unlock()
+
+				// Calculating drops is harder now. We log the state instead.
+				log.Printf("Second %d: Target Load=%-4d | Inferenced (approx)=%-4d | Rate: %.2f",
+					t, eventsThisSecond, inferenced, rateLimiter.GetRate())
+
+				metricsChan <- secondMetrics{
+					totalEvents:      eventsThisSecond,
+					inferencedEvents: inferenced,
+					finalRate:        rateLimiter.GetRate(),
+				}
+			}
+		}
+		// Wait for all event-producing goroutines to finish before closing channels.
+		producerWg.Wait()
+		close(requestChan) // Signal workers to stop
+		close(metricsChan)
+	}()
+
+	// --- Wait for results ---
+	var allMetrics []secondMetrics
+	for sm := range metricsChan {
+		allMetrics = append(allMetrics, sm)
+	}
+
+	workerWg.Wait() // Wait for all workers to finish
+	log.Println("Simulation complete.")
+
+	// --- Plotting ---
+	var seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr []float64
+	for i, m := range allMetrics {
+		seconds = append(seconds, float64(i))
+		totalEventsArr = append(totalEventsArr, float64(m.totalEvents))
+		inferencedEventsArr = append(inferencedEventsArr, float64(m.inferencedEvents))
+		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacity))
+		rateArr = append(rateArr, m.finalRate)
+	}
+
+	err := plotmetrics.PlotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr)
 	if err != nil {
 		log.Fatalf("Error plotting results: %v", err)
 	}
-	log.Println("Graph generated: simulation_results.png")
-}
-
-// plotResults plots three lines: GPU capacity, total events per second, and inferenced events per second.
-func plotResults(x, total, inferenced, capacity []float64) error {
-	p := plot.New()
-	p.Title.Text = "Dynamic Rate Limiter Simulation Results"
-	p.X.Label.Text = "Time (seconds)"
-	p.Y.Label.Text = "Events per Second"
-
-	totalPoints := make(plotter.XYs, len(x))
-	inferencedPoints := make(plotter.XYs, len(x))
-	capacityPoints := make(plotter.XYs, len(x))
-	for i := range x {
-		totalPoints[i].X = x[i]
-		totalPoints[i].Y = total[i]
-		inferencedPoints[i].X = x[i]
-		inferencedPoints[i].Y = inferenced[i]
-		capacityPoints[i].X = x[i]
-		capacityPoints[i].Y = capacity[i]
-	}
-
-	// Define custom colors.
-	blue := color.RGBA{R: 0, G: 0, B: 255, A: 255}
-	yellow := color.RGBA{R: 255, G: 255, B: 0, A: 255}
-	green := color.RGBA{R: 0, G: 128, B: 0, A: 255}
-
-	// Plot GPU Capacity (blue).
-	capacityLine, err := plotter.NewLine(capacityPoints)
-	if err != nil {
-		return err
-	}
-	capacityLine.LineStyle.Width = vg.Points(2)
-	capacityLine.LineStyle.Color = blue
-	p.Add(capacityLine)
-	p.Legend.Add("GPU Capacity", capacityLine)
-
-	// Plot Total Events (yellow).
-	totalLine, err := plotter.NewLine(totalPoints)
-	if err != nil {
-		return err
-	}
-	totalLine.LineStyle.Width = vg.Points(2)
-	totalLine.LineStyle.Color = yellow
-	p.Add(totalLine)
-	p.Legend.Add("Total Events", totalLine)
-
-	// Plot Inferenced Events (green).
-	inferencedLine, err := plotter.NewLine(inferencedPoints)
-	if err != nil {
-		return err
-	}
-	inferencedLine.LineStyle.Width = vg.Points(2)
-	inferencedLine.LineStyle.Color = green
-	p.Add(inferencedLine)
-	p.Legend.Add("Inferenced Events", inferencedLine)
-
-	p.Legend.Top = true
-
-	timestamp := time.Now().Format(time.RFC3339)
-	if err := p.Save(8*vg.Inch, 4*vg.Inch, fmt.Sprintf("./output/simulation_results_%s.png", timestamp)); err != nil {
-		return err
-	}
-	return nil
+	log.Println("Graph generated.")
 }
