@@ -35,9 +35,9 @@ func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *rate
 			"pod_"+id,
 			125,   // capacity
 			100.0, // initial rate
-			30.0,  // min rate
-			150.0, // max rate
-			50,    // adjust step
+			80.0,  // min rate
+			125.0, // max rate
+			15,    // adjust step
 			30,    // backoff step
 
 			// 125,   // capacity (bucket size)
@@ -99,11 +99,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	simDuration := 120          // seconds
-	numPods := 2                // number of VA Pipeline pods
-	gpuMaxCapacityPerPod := 125 // 125/3 ≈ 42 per pod
-	numWorkers := 200           // worker pool size
-	processingDelay := 10 * time.Millisecond
+	simDuration := 120 // seconds
+	numPods := 2       // number of VA Pipeline pods
+	gpuMaxCapacityPerPod := 125
+	numWorkers := 75 // worker pool size
+	processingDelay := 20 * time.Millisecond
 
 	l := logrus.New()
 	l.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
@@ -121,6 +121,14 @@ func main() {
 	var workerWg sync.WaitGroup
 	workerWg.Add(numWorkers)
 
+	newGenerateLoadConfig := generateLoadConfig{
+		baseline:       200.0,
+		amplitude:      60.0,
+		period:         90.0,
+		jitterPercent:  20,
+		peakSecond:     55,
+		peakMultiplier: 2.5,
+	}
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer workerWg.Done()
@@ -167,7 +175,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				eventsThisSecond := generateLoad(t, 80.0, 60.0, 90.0, 30, 45, 3.0)
+				eventsThisSecond := generateLoad(t, newGenerateLoadConfig)
 
 				// Generate camera IDs and dispatch events
 				if eventsThisSecond > 0 {
@@ -243,12 +251,12 @@ func main() {
 	log.Println("Graph generated.")
 }
 
-func generateLoad(second int, baseline, amplitude, period float64, jitterPercent int, peakSecond int, peakMultiplier float64) int {
-	baseLoad := baseline + amplitude*math.Sin(2*math.Pi*float64(second)/period)
-	jitter := (rand.Float64() - 0.5) * (float64(jitterPercent) / 100.0) * baseLoad
+func generateLoad(second int, loadConfig generateLoadConfig) int {
+	baseLoad := loadConfig.baseline + loadConfig.amplitude*math.Sin(2*math.Pi*float64(second)/loadConfig.period)
+	jitter := (rand.Float64() - 0.5) * (float64(loadConfig.jitterPercent) / 100.0) * baseLoad
 	loadWithJitter := baseLoad + jitter
-	if second == peakSecond {
-		loadWithJitter *= peakMultiplier
+	if second == loadConfig.peakSecond {
+		loadWithJitter *= loadConfig.peakMultiplier
 	}
 	return int(math.Max(loadWithJitter, 0))
 }
@@ -259,4 +267,11 @@ type secondMetrics struct {
 	droppedByRateLimiter int
 	droppedByPipeline    int
 	finalRate            float64
+}
+
+type generateLoadConfig struct {
+	baseline, amplitude, period float64
+	jitterPercent               int
+	peakSecond                  int
+	peakMultiplier              float64
 }

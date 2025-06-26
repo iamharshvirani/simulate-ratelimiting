@@ -63,8 +63,8 @@ func NewDynamicRateLimiter(ctx context.Context, log *SimpleLogger, name string, 
 		adjustStep:       adjustStep,
 		backoffStep:      backoffStep,
 		lastRefill:       time.Now(),
-		successThreshold: 3, // Increase rate after just 3 successes
-		failureThreshold: 5, // Tolerate up to 5 failures before reducing rate
+		successThreshold: 3,  // Increase rate after successes
+		failureThreshold: 10, // Tolerate failures before reducing rate
 	}
 }
 
