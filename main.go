@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/iamharshvirani/simulate-ratelimiting/plotmetrics"
@@ -24,6 +25,7 @@ type VAPipelinePod struct {
 	processedThisSec int
 	lastTick         time.Time
 	rateLimiter      ratelimiter.DynamicRateLimiter
+	totalProcessed   uint64 // monotonic counter for accurate metrics
 }
 
 func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *ratelimiter.SimpleLogger) *VAPipelinePod {
@@ -39,8 +41,8 @@ func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *rate
 			125.0, // initial rate
 			60.0,  // min rate
 			125.0, // max rate
-			25,    // adjust step
-			15,    // backoff step
+			5,     // adjust step
+			10,    // backoff step
 
 			// 125,   // capacity (bucket size)
 			// 100.0, // initial refill rate tokens/sec
@@ -63,9 +65,15 @@ func (p *VAPipelinePod) Process() bool {
 
 	if p.processedThisSec < p.capacityPerSec {
 		p.processedThisSec++
+		atomic.AddUint64(&p.totalProcessed, 1)
 		return true
 	}
 	return false
+}
+
+// GetTotalProcessed returns the monotonic processed counter.
+func (p *VAPipelinePod) GetTotalProcessed() uint64 {
+	return atomic.LoadUint64(&p.totalProcessed)
 }
 
 // PipelineCluster manages multiple VA Pipeline pods
@@ -119,8 +127,8 @@ func main() {
 	simDuration := 120 // seconds
 	numPods := 6       // number of VA Pipeline pods
 	gpuMaxCapacityPerPod := 125
-	numWorkers := 90 // worker pool size
-	processingDelay := 100 * time.Millisecond
+	numWorkers := 75 // worker pool size
+	processingDelay := 120 * time.Millisecond
 
 	// Logrus setup → file + console
 	l := logrus.New()
@@ -214,6 +222,7 @@ func main() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
+		prevTotals := make([]uint64, numPods)
 		for t := 0; t < simDuration; t++ {
 			select {
 			case <-ctx.Done():
@@ -228,7 +237,7 @@ func main() {
 					go func(numEvents int, ivl time.Duration) {
 						defer producerWg.Done()
 						for i := 0; i < numEvents; i++ {
-							cameraId := fmt.Sprintf("cam_%d", rand.Intn(500))
+							cameraId := fmt.Sprintf("cam_%d", rand.Intn(250))
 							requestChan <- struct {
 								cameraId  string
 								timestamp time.Time
@@ -238,24 +247,23 @@ func main() {
 					}(eventsThisSecond, interval)
 				}
 
-				// Collect metrics from all pods
+				// Collect metrics using monotonic counters
 				var totalProcessed int
 				var totalRate float64
-				for _, pod := range cluster.pods {
-					pod.mu.Lock()
-					processed := pod.processedThisSec
-					rate := pod.rateLimiter.GetRate()
-					pod.mu.Unlock()
-					log.Printf("Pod %s: Processed=%d", pod.id, processed)
-					totalProcessed += processed
-					totalRate += rate
+				for i, pod := range cluster.pods {
+					curr := pod.GetTotalProcessed()
+					delta := int(curr - prevTotals[i])
+					prevTotals[i] = curr
+					log.Printf("Pod %s: Processed=%d", pod.id, delta)
+					totalProcessed += delta
+					totalRate += pod.rateLimiter.GetRate()
 				}
 
 				// log.Printf("Second %d: Target=%d, Processed=%d, AvgRate=%.2f",
 				// 	t, eventsThisSecond, totalProcessed, totalRate/float64(numPods))
 
 				log.Printf("Second %d: Target Load=%-4d | totalProcessed=%d | Rate: %.2f",
-					t, eventsThisSecond, totalProcessed, totalRate/float64(numPods))
+					t, eventsThisSecond, totalProcessed, totalRate)
 
 				metricsChan <- secondMetrics{
 					totalEvents:      eventsThisSecond,
