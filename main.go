@@ -39,8 +39,8 @@ func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *rate
 			125.0, // initial rate
 			60.0,  // min rate
 			125.0, // max rate
-			20,    // adjust step
-			18,    // backoff step
+			25,    // adjust step
+			15,    // backoff step
 
 			// 125,   // capacity (bucket size)
 			// 100.0, // initial refill rate tokens/sec
@@ -116,11 +116,11 @@ func main() {
 	// Standard library log → file + console
 	log.SetOutput(multiOut)
 
-	simDuration := 10 // seconds
-	numPods := 6      // number of VA Pipeline pods
+	simDuration := 120 // seconds
+	numPods := 6       // number of VA Pipeline pods
 	gpuMaxCapacityPerPod := 125
-	numWorkers := 75 // worker pool size
-	processingDelay := 10 * time.Millisecond
+	numWorkers := 90 // worker pool size
+	processingDelay := 100 * time.Millisecond
 
 	// Logrus setup → file + console
 	l := logrus.New()
@@ -130,10 +130,13 @@ func main() {
 
 	cluster := NewPipelineCluster(numPods, gpuMaxCapacityPerPod, ctx, logger)
 
+	channelBufferSize := 5000
+
 	requestChan := make(chan struct {
 		cameraId  string
 		timestamp time.Time
-	}, numWorkers)
+		// }, numWorkers)
+	}, channelBufferSize)
 	metricsChan := make(chan secondMetrics, simDuration)
 
 	// Start worker pool
@@ -155,7 +158,7 @@ func main() {
 		baseline:       450.0,
 		amplitude:      150.0,
 		period:         60.0,
-		jitterPercent:  10,
+		jitterPercent:  7,
 		peakSecond:     90,
 		peakMultiplier: 1.1,
 	}
@@ -185,19 +188,19 @@ func main() {
 
 					// Try to get rate limiter token
 					if !pod.rateLimiter.Wait("", 20*time.Millisecond) {
+						pod.rateLimiter.LogFailure()
 						continue
 					}
 
 					// Simulate processing
 					// time.Sleep(processingDelay + time.Duration(rand.Intn(5))*time.Millisecond)
 
-					time.Sleep(processingDelay + time.Duration(rand.Float64()*30)*time.Millisecond)
-
 					// Try to process on the pod
 					if pod.Process() {
 						pod.rateLimiter.LogSuccess()
+						time.Sleep(processingDelay + time.Duration(rand.Float64()*30)*time.Millisecond)
 					} else {
-						pod.rateLimiter.LogFailure()
+						// pod.rateLimiter.LogFailure()
 					}
 				}
 			}
@@ -225,12 +228,12 @@ func main() {
 					go func(numEvents int, ivl time.Duration) {
 						defer producerWg.Done()
 						for i := 0; i < numEvents; i++ {
-							cameraId := fmt.Sprintf("cam_%d", rand.Intn(7))
+							cameraId := fmt.Sprintf("cam_%d", rand.Intn(500))
 							requestChan <- struct {
 								cameraId  string
 								timestamp time.Time
 							}{cameraId, time.Now()}
-							time.Sleep(ivl)
+							// time.Sleep(ivl)
 						}
 					}(eventsThisSecond, interval)
 				}

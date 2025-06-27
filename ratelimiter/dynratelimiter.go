@@ -32,8 +32,8 @@ type dynamicRateLimiter struct {
 	ctx         context.Context
 	log         *SimpleLogger
 	name        string
-	capacity    int     // maximum tokens
-	tokens      int     // current tokens available
+	capacity    float64 // maximum tokens
+	tokens      float64 // current tokens available
 	refillRate  float64 // tokens per second; dynamic value
 	lastRefill  time.Time
 	minRate     float64 // lower bound for refill rate
@@ -53,7 +53,7 @@ type dynamicRateLimiter struct {
 }
 
 // NewDynamicRateLimiter creates an instance with initial parameters.
-func NewDynamicRateLimiter(ctx context.Context, log *SimpleLogger, name string, capacity int, initialRate, minRate, maxRate, adjustStep, backoffStep float64) *dynamicRateLimiter {
+func NewDynamicRateLimiter(ctx context.Context, log *SimpleLogger, name string, capacity float64, initialRate, minRate, maxRate, adjustStep, backoffStep float64) *dynamicRateLimiter {
 	return &dynamicRateLimiter{
 		ctx:              ctx,
 		log:              log,
@@ -77,7 +77,7 @@ func NewDynamicRateLimiter(ctx context.Context, log *SimpleLogger, name string, 
 func (drl *dynamicRateLimiter) refill() {
 	now := time.Now()
 	elapsed := now.Sub(drl.lastRefill).Seconds()
-	addedTokens := int(elapsed * drl.refillRate)
+	addedTokens := elapsed * drl.refillRate
 	if addedTokens > 0 {
 		drl.tokens += addedTokens
 		if drl.tokens > drl.capacity {
@@ -89,7 +89,7 @@ func (drl *dynamicRateLimiter) refill() {
 
 // Wait blocks until a token is available.
 func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) bool {
-	start := time.Now()
+	// start := time.Now()
 	for {
 		select {
 		case <-drl.ctx.Done():
@@ -105,10 +105,12 @@ func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) b
 			return true
 		}
 		drl.mu.Unlock()
+		time.Sleep(1 * time.Millisecond)
+		continue
 
-		if accountType == "basic" && time.Since(start) >= timeout {
-			return false
-		}
+		// if accountType == "basic" && time.Since(start) >= timeout {
+		// 	return false
+		// }
 		// time.Sleep(10 * time.Millisecond)
 	}
 }
