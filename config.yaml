@@ -2,5 +2,5 @@ simulation:
   duration: 120
   numPods: 6
   gpuMaxCapacityPerPod: 125
-  numWorkers: 300
-  processingDelay: 350ms
+  numWorkers: 600
+  processingDelay: 750ms

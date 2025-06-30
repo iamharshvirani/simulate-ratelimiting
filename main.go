@@ -150,36 +150,16 @@ func main() {
 	}, channelBufferSize)
 	metricsChan := make(chan utils.SecondMetrics, simDuration)
 
-	// Start worker pool
 	var workerWg sync.WaitGroup
 	workerWg.Add(numWorkers)
 
-	// newGenerateLoadConfig := generateLoadConfig{
-	// 	pattern:        "sine",
-	// 	baseline:       200.0,
-	// 	amplitude:      60.0,
-	// 	period:         90.0,
-	// 	jitterPercent:  20,
-	// 	peakSecond:     55,
-	// 	peakMultiplier: 2.5,
-	// }
-	newGenerateSineLoadConfig := utils.GenerateLoadConfig{
-		Pattern:        "sine",
-		Baseline:       630.0,
-		Amplitude:      150.0,
-		Period:         60.0,
-		JitterPercent:  7,
-		PeakSecond:     90,
-		PeakMultiplier: 1.1,
+	// Use predefined load configuration instead of defining it inline
+	loadConfigName := "constant_high_above_capacity"
+	loadConfig, err := utils.GetLoadConfig(loadConfigName)
+	if err != nil {
+		log.Fatalf("Error getting load configuration: %v", err)
 	}
-
-	// newGenerateStepLoadConfig := generateLoadConfig{
-	// 	pattern:       "step",
-	// 	baseline:      240.0,
-	// 	amplitude:     5.0,
-	// 	stepDuration:  10,
-	// 	jitterPercent: 20,
-	// }
+	log.Printf("Using load configuration: %s", loadConfigName)
 
 	for i := 0; i < numWorkers; i++ {
 		go func() {
@@ -237,7 +217,7 @@ func main() {
 			secondStart := time.Now() // precisely at wall-clock boundary
 
 			// Generate load for this second (as before)
-			eventsThisSecond := utils.GenerateLoad(t, newGenerateSineLoadConfig)
+			eventsThisSecond := utils.GenerateLoad(t, loadConfig)
 
 			// Generate camera IDs and dispatch events
 			if eventsThisSecond > 0 {

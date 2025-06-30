@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 )
@@ -18,6 +19,73 @@ type GenerateLoadConfig struct {
 
 	// Step pattern parameters
 	StepDuration int
+}
+
+// Predefined load configurations
+var predefinedConfigs = map[string]GenerateLoadConfig{
+	"sine_default": {
+		Pattern:        "sine",
+		Baseline:       630.0,
+		Amplitude:      150.0,
+		Period:         60.0,
+		JitterPercent:  7,
+		PeakSecond:     90,
+		PeakMultiplier: 1.1,
+	},
+	"sine_low": {
+		Pattern:        "sine",
+		Baseline:       200.0,
+		Amplitude:      60.0,
+		Period:         90.0,
+		JitterPercent:  20,
+		PeakSecond:     55,
+		PeakMultiplier: 2.5,
+	},
+	"sine_high_above_capacity": {
+		Pattern:        "sine",
+		Baseline:       800.0,
+		Amplitude:      100.0,
+		Period:         60.0,
+		JitterPercent:  7,
+		PeakSecond:     90,
+		PeakMultiplier: 1.1,
+	},
+	"step_default": {
+		Pattern:       "step",
+		Baseline:      240.0,
+		Amplitude:     5.0,
+		StepDuration:  10,
+		JitterPercent: 20,
+	},
+	"constant": {
+		Pattern:       "constant",
+		Baseline:      300.0,
+		JitterPercent: 5,
+	},
+	"constant_high_above_capacity": {
+		Pattern:       "constant",
+		Baseline:      800.0,
+		JitterPercent: 5,
+	},
+}
+
+// GetLoadConfig returns a predefined load configuration by name.
+// If the name doesn't exist, it returns an error.
+func GetLoadConfig(name string) (GenerateLoadConfig, error) {
+	config, exists := predefinedConfigs[name]
+	if !exists {
+		return GenerateLoadConfig{}, fmt.Errorf("load configuration '%s' not found", name)
+	}
+	return config, nil
+}
+
+// ListAvailableConfigs returns a list of all available configuration names
+func ListAvailableConfigs() []string {
+	var names []string
+	for name := range predefinedConfigs {
+		names = append(names, name)
+	}
+	return names
 }
 
 func GenerateLoad(second int, loadConfig GenerateLoadConfig) int {

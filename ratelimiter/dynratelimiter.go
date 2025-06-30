@@ -22,9 +22,15 @@ type DynamicRateLimiter interface {
 	LogSuccess()
 	LogFailure()
 	GetRate() float64
-	// Reduce is kept for compatibility with the original interface if needed,
-	// but LogFailure is preferred.
 	Reduce()
+	GetMetrics() Metrics
+}
+
+// Metrics holds the internal state of the rate limiter for monitoring.
+type Metrics struct {
+	Tokens     float64
+	RefillRate float64
+	Capacity   float64
 }
 
 // dynamicRateLimiter defines an adaptive token bucket rate limiter.
@@ -222,4 +228,15 @@ func (drl *dynamicRateLimiter) GetRate() float64 {
 	drl.mu.Lock()
 	defer drl.mu.Unlock()
 	return drl.refillRate
+}
+
+// GetMetrics returns the current metrics of the rate limiter.
+func (drl *dynamicRateLimiter) GetMetrics() Metrics {
+	drl.mu.Lock()
+	defer drl.mu.Unlock()
+	return Metrics{
+		Tokens:     drl.tokens,
+		RefillRate: drl.refillRate,
+		Capacity:   drl.capacity,
+	}
 }
