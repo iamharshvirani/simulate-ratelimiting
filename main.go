@@ -23,7 +23,7 @@ type VAPipelinePod struct {
 	id               string
 	capacityPerSec   int
 	processedThisSec int
-	lastTick         time.Time
+	lastTickUnix     int64
 	rateLimiter      ratelimiter.DynamicRateLimiter
 	totalProcessed   uint64 // monotonic counter for accurate metrics
 }
@@ -32,7 +32,7 @@ func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *rate
 	return &VAPipelinePod{
 		id:             id,
 		capacityPerSec: capacity,
-		lastTick:       time.Now(),
+		lastTickUnix:   time.Now().Unix(),
 		rateLimiter: ratelimiter.NewDynamicRateLimiter(
 			ctx,
 			logger,
@@ -58,8 +58,11 @@ func (p *VAPipelinePod) Process() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if time.Since(p.lastTick) >= time.Second {
-		p.lastTick = time.Now()
+	now := time.Now()
+	currentSecond := now.Unix()
+
+	if p.lastTickUnix != currentSecond {
+		p.lastTickUnix = currentSecond
 		p.processedThisSec = 0
 	}
 
