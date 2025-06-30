@@ -15,6 +15,7 @@ import (
 	"github.com/iamharshvirani/simulate-ratelimiting/plotmetrics"
 	"github.com/iamharshvirani/simulate-ratelimiting/ratelimiter"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 )
 
 // VAPipelinePod simulates a VA Pipeline pod with its own capacity
@@ -109,6 +110,14 @@ func cameraHash(cameraId string) uint32 {
 }
 
 func main() {
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath("./")
+
+	if err := viper.ReadInConfig(); err != nil {
+		log.Fatalf("Error reading config file: %s", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -127,11 +136,11 @@ func main() {
 	// Standard library log → file + console
 	log.SetOutput(multiOut)
 
-	simDuration := 120 // seconds
-	numPods := 6       // number of VA Pipeline pods
-	gpuMaxCapacityPerPod := 125
-	numWorkers := 300 // worker pool size
-	processingDelay := 120 * time.Millisecond
+	simDuration := viper.GetInt("simulation.duration")
+	numPods := viper.GetInt("simulation.numPods")
+	gpuMaxCapacityPerPod := viper.GetInt("simulation.gpuMaxCapacityPerPod")
+	numWorkers := viper.GetInt("simulation.numWorkers")
+	processingDelay := viper.GetDuration("simulation.processingDelay")
 
 	// Logrus setup → file + console
 	l := logrus.New()
@@ -222,57 +231,65 @@ func main() {
 	log.Println("Starting simulation...")
 	go func() {
 		var producerWg sync.WaitGroup
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-
 		prevTotals := make([]uint64, numPods)
+
+		// Align to the next exact wall-clock second before starting the loop
+		firstBoundary := time.Now().Truncate(time.Second).Add(time.Second)
+		time.Sleep(time.Until(firstBoundary))
+
 		for t := 0; t < simDuration; t++ {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				eventsThisSecond := generateLoad(t, newGenerateSineLoadConfig)
+			default:
+			}
 
-				// Generate camera IDs and dispatch events
-				if eventsThisSecond > 0 {
-					interval := time.Second / time.Duration(eventsThisSecond)
-					producerWg.Add(1)
-					go func(numEvents int, ivl time.Duration) {
-						defer producerWg.Done()
-						for i := 0; i < numEvents; i++ {
-							cameraId := fmt.Sprintf("cam_%d", rand.Intn(250))
-							requestChan <- struct {
-								cameraId  string
-								timestamp time.Time
-							}{cameraId, time.Now()}
-							// time.Sleep(ivl)
-						}
-					}(eventsThisSecond, interval)
-				}
+			secondStart := time.Now() // precisely at wall-clock boundary
 
-				// Collect metrics using monotonic counters
-				var totalProcessed int
-				var totalRate float64
-				for i, pod := range cluster.pods {
-					curr := pod.GetTotalProcessed()
-					delta := int(curr - prevTotals[i])
-					prevTotals[i] = curr
-					log.Printf("Pod %s: Processed=%d", pod.id, delta)
-					totalProcessed += delta
-					totalRate += pod.rateLimiter.GetRate()
-				}
+			// Generate load for this second (as before)
+			eventsThisSecond := generateLoad(t, newGenerateSineLoadConfig)
 
-				// log.Printf("Second %d: Target=%d, Processed=%d, AvgRate=%.2f",
-				// 	t, eventsThisSecond, totalProcessed, totalRate/float64(numPods))
+			// Generate camera IDs and dispatch events
+			if eventsThisSecond > 0 {
+				interval := time.Second / time.Duration(eventsThisSecond+1) // +1 to avoid div-by-zero
 
-				log.Printf("Second %d: Target Load=%-4d | totalProcessed=%d | Rate: %.2f",
-					t, eventsThisSecond, totalProcessed, totalRate)
+				producerWg.Add(1)
+				go func(numEvents int, ivl time.Duration) {
+					defer producerWg.Done()
+					for i := 0; i < numEvents; i++ {
+						cameraId := fmt.Sprintf("cam_%d", rand.Intn(250))
+						requestChan <- struct {
+							cameraId  string
+							timestamp time.Time
+						}{cameraId: cameraId, timestamp: time.Now()}
+						time.Sleep(ivl)
+					}
+				}(eventsThisSecond, interval)
+			}
 
-				metricsChan <- secondMetrics{
-					totalEvents:      eventsThisSecond,
-					inferencedEvents: totalProcessed,
-					finalRate:        totalRate / float64(numPods),
-				}
+			// Sleep until the end of this wall-clock second
+			nextBoundary := secondStart.Truncate(time.Second).Add(time.Second)
+			time.Sleep(time.Until(nextBoundary))
+
+			// Collect metrics using monotonic counters
+			var totalProcessed int
+			var totalRate float64
+			for i, pod := range cluster.pods {
+				curr := pod.GetTotalProcessed()
+				delta := int(curr - prevTotals[i])
+				prevTotals[i] = curr
+				log.Printf("Pod %s: Processed=%d", pod.id, delta)
+				totalProcessed += delta
+				totalRate += pod.rateLimiter.GetRate()
+			}
+
+			log.Printf("Second %d: Target Load=%-4d | totalProcessed=%d | Rate: %.2f",
+				t, eventsThisSecond, totalProcessed, totalRate)
+
+			metricsChan <- secondMetrics{
+				totalEvents:      eventsThisSecond,
+				inferencedEvents: totalProcessed,
+				finalRate:        totalRate / float64(numPods),
 			}
 		}
 		producerWg.Wait()
