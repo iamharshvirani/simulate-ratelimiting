@@ -154,7 +154,7 @@ func main() {
 	workerWg.Add(numWorkers)
 
 	// Use predefined load configuration instead of defining it inline
-	loadConfigName := "constant_high_above_capacity"
+	loadConfigName := "sine_default"
 	loadConfig, err := utils.GetLoadConfig(loadConfigName)
 	if err != nil {
 		log.Fatalf("Error getting load configuration: %v", err)
@@ -190,7 +190,7 @@ func main() {
 						pod.rateLimiter.LogSuccess()
 						time.Sleep(processingDelay + time.Duration(rand.Float64()*30)*time.Millisecond)
 					} else {
-						// pod.rateLimiter.LogFailure()
+						pod.rateLimiter.LogFailure()
 					}
 				}
 			}
@@ -244,13 +244,20 @@ func main() {
 			// Collect metrics using monotonic counters
 			var totalProcessed int
 			var totalRate float64
+			ratesPerPod := make([]float64, numPods)
 			for i, pod := range cluster.pods {
 				curr := pod.GetTotalProcessed()
 				delta := int(curr - prevTotals[i])
 				prevTotals[i] = curr
-				log.Printf("Pod %s: Processed=%d", pod.id, delta)
+
+				// Get and log rate limiter metrics for this pod
+				metrics := pod.rateLimiter.GetMetrics()
+				log.Printf("Pod %s: Processed=%d Tokens=%.2f RefillRate=%.2f", pod.id, delta, metrics.Tokens, metrics.RefillRate)
+
 				totalProcessed += delta
-				totalRate += pod.rateLimiter.GetRate()
+				rate := pod.rateLimiter.GetRate()
+				totalRate += rate
+				ratesPerPod[i] = rate
 			}
 
 			log.Printf("Second %d: Target Load=%-4d | totalProcessed=%d | Rate: %.2f",
@@ -259,7 +266,7 @@ func main() {
 			metricsChan <- utils.SecondMetrics{
 				TotalEvents:      eventsThisSecond,
 				InferencedEvents: totalProcessed,
-				FinalRate:        totalRate / float64(numPods),
+				RatesPerPod:      ratesPerPod,
 			}
 		}
 		producerWg.Wait()

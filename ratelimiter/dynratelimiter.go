@@ -72,8 +72,8 @@ func NewDynamicRateLimiter(ctx context.Context, log *SimpleLogger, name string, 
 		adjustStep:       adjustStep,
 		backoffStep:      backoffStep,
 		lastRefill:       time.Now(),
-		successThreshold: 3,  // Increase rate after successes
-		failureThreshold: 10, // Tolerate failures before reducing rate
+		successThreshold: 5, // Increase rate after successes
+		failureThreshold: 3, // Tolerate failures before reducing rate
 		lastIncrease:     time.Now(),
 		lastDecrease:     time.Now(),
 	}
@@ -107,6 +107,9 @@ func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) b
 		drl.refill()
 		if drl.tokens > 0 {
 			drl.tokens--
+			if drl.tokens < 0 {
+				drl.tokens = 0
+			}
 			drl.mu.Unlock()
 			return true
 		}
@@ -134,7 +137,7 @@ func (drl *dynamicRateLimiter) increaseRate() {
 	}
 	if newRate != drl.refillRate {
 		drl.refillRate = newRate
-		drl.log.Infoxf(nil, "Rate increased to %.2f", newRate)
+		// drl.log.Infoxf(nil, "Rate increased to %.2f", newRate)
 	}
 }
 
@@ -146,7 +149,7 @@ func (drl *dynamicRateLimiter) reduceRate() {
 	}
 	if newRate != drl.refillRate {
 		drl.refillRate = newRate
-		drl.log.Infoxf(nil, "Rate reduced to %.2f", newRate)
+		// drl.log.Infoxf(nil, "Rate reduced to %.2f", newRate)
 	}
 }
 
