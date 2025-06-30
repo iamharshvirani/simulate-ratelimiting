@@ -1,4 +1,4 @@
-package plotmetrics
+package utils
 
 import (
 	"fmt"
@@ -9,6 +9,30 @@ import (
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
 )
+
+// SecondMetrics holds the metrics for a single second of the simulation.
+type SecondMetrics struct {
+	TotalEvents          int
+	InferencedEvents     int
+	DroppedByRateLimiter int
+	DroppedByPipeline    int
+	FinalRate            float64
+}
+
+// GeneratePlotFromMetrics prepares the data and generates the plot.
+func GeneratePlotFromMetrics(allMetrics []SecondMetrics, gpuMaxCapacityPerPod int, numPods int) error {
+	// Prepare plotting data
+	var seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr []float64
+	for i, m := range allMetrics {
+		seconds = append(seconds, float64(i))
+		totalEventsArr = append(totalEventsArr, float64(m.TotalEvents))
+		inferencedEventsArr = append(inferencedEventsArr, float64(m.InferencedEvents))
+		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacityPerPod*numPods))
+		rateArr = append(rateArr, m.FinalRate)
+	}
+
+	return PlotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr)
+}
 
 func PlotResults(x, total, inferenced, capacity, rate []float64) error {
 	p := plot.New()

@@ -5,20 +5,18 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/iamharshvirani/simulate-ratelimiting/plotmetrics"
 	"github.com/iamharshvirani/simulate-ratelimiting/ratelimiter"
+	"github.com/iamharshvirani/simulate-ratelimiting/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
-// VAPipelinePod simulates a VA Pipeline pod with its own capacity
 type VAPipelinePod struct {
 	mu               sync.Mutex
 	id               string
@@ -44,13 +42,6 @@ func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *rate
 			125.0, // max rate
 			5,     // adjust step
 			7,     // backoff step
-
-			// 125,   // capacity (bucket size)
-			// 100.0, // initial refill rate tokens/sec
-			// 30.0,  // min rate
-			// 150.0, // max rate
-			// 16,    // adjust step
-			// 20,    // backoff step
 		),
 	}
 }
@@ -157,7 +148,7 @@ func main() {
 		timestamp time.Time
 		// }, numWorkers)
 	}, channelBufferSize)
-	metricsChan := make(chan secondMetrics, simDuration)
+	metricsChan := make(chan utils.SecondMetrics, simDuration)
 
 	// Start worker pool
 	var workerWg sync.WaitGroup
@@ -172,15 +163,14 @@ func main() {
 	// 	peakSecond:     55,
 	// 	peakMultiplier: 2.5,
 	// }
-
-	newGenerateSineLoadConfig := generateLoadConfig{
-		pattern:        "sine",
-		baseline:       630.0,
-		amplitude:      150.0,
-		period:         60.0,
-		jitterPercent:  7,
-		peakSecond:     90,
-		peakMultiplier: 1.1,
+	newGenerateSineLoadConfig := utils.GenerateLoadConfig{
+		Pattern:        "sine",
+		Baseline:       630.0,
+		Amplitude:      150.0,
+		Period:         60.0,
+		JitterPercent:  7,
+		PeakSecond:     90,
+		PeakMultiplier: 1.1,
 	}
 
 	// newGenerateStepLoadConfig := generateLoadConfig{
@@ -247,7 +237,7 @@ func main() {
 			secondStart := time.Now() // precisely at wall-clock boundary
 
 			// Generate load for this second (as before)
-			eventsThisSecond := generateLoad(t, newGenerateSineLoadConfig)
+			eventsThisSecond := utils.GenerateLoad(t, newGenerateSineLoadConfig)
 
 			// Generate camera IDs and dispatch events
 			if eventsThisSecond > 0 {
@@ -286,10 +276,10 @@ func main() {
 			log.Printf("Second %d: Target Load=%-4d | totalProcessed=%d | Rate: %.2f",
 				t, eventsThisSecond, totalProcessed, totalRate)
 
-			metricsChan <- secondMetrics{
-				totalEvents:      eventsThisSecond,
-				inferencedEvents: totalProcessed,
-				finalRate:        totalRate / float64(numPods),
+			metricsChan <- utils.SecondMetrics{
+				TotalEvents:      eventsThisSecond,
+				InferencedEvents: totalProcessed,
+				FinalRate:        totalRate / float64(numPods),
 			}
 		}
 		producerWg.Wait()
@@ -298,7 +288,7 @@ func main() {
 	}()
 
 	// Collect and plot results
-	var allMetrics []secondMetrics
+	var allMetrics []utils.SecondMetrics
 	for m := range metricsChan {
 		allMetrics = append(allMetrics, m)
 	}
@@ -306,88 +296,9 @@ func main() {
 	workerWg.Wait()
 	log.Println("Simulation complete.")
 
-	// Prepare plotting data
-	var seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr []float64
-	for i, m := range allMetrics {
-		seconds = append(seconds, float64(i))
-		totalEventsArr = append(totalEventsArr, float64(m.totalEvents))
-		inferencedEventsArr = append(inferencedEventsArr, float64(m.inferencedEvents))
-		maxCapacityArr = append(maxCapacityArr, float64(gpuMaxCapacityPerPod*numPods))
-		rateArr = append(rateArr, m.finalRate)
-	}
-
-	err = plotmetrics.PlotResults(seconds, totalEventsArr, inferencedEventsArr, maxCapacityArr, rateArr)
+	err = utils.GeneratePlotFromMetrics(allMetrics, gpuMaxCapacityPerPod, numPods)
 	if err != nil {
 		log.Fatalf("Error plotting results: %v", err)
 	}
 	log.Println("Graph generated.")
-}
-
-func generateLoad(second int, loadConfig generateLoadConfig) int {
-	// baseLoad := loadConfig.baseline + loadConfig.amplitude*math.Sin(2*math.Pi*float64(second)/loadConfig.period)
-	// jitter := (rand.Float64() - 0.5) * (float64(loadConfig.jitterPercent) / 100.0) * baseLoad
-	// loadWithJitter := baseLoad + jitter
-	// if second == loadConfig.peakSecond {
-	// 	loadWithJitter *= loadConfig.peakMultiplier
-	// }
-	// return int(math.Max(loadWithJitter, 0))
-
-	var baseLoad float64
-
-	switch loadConfig.pattern {
-	case "sine":
-		// Sine wave pattern
-		baseLoad = loadConfig.baseline + loadConfig.amplitude*math.Sin(2*math.Pi*float64(second)/loadConfig.period)
-	case "step":
-		// Step pattern - alternates between high and low load
-		if (second/loadConfig.stepDuration)%2 == 0 {
-			baseLoad = loadConfig.baseline + loadConfig.amplitude
-		} else {
-			baseLoad = loadConfig.baseline - loadConfig.amplitude
-		}
-	case "constant":
-		// Constant load with optional peak
-		baseLoad = loadConfig.baseline
-	default:
-		// Default to sine wave if pattern is not recognized
-		baseLoad = loadConfig.baseline + loadConfig.amplitude*math.Sin(2*math.Pi*float64(second)/loadConfig.period)
-	}
-
-	// Apply jitter if enabled
-	jitter := 0.0
-	if loadConfig.jitterPercent > 0 {
-		jitter = (rand.Float64() - 0.5) * (float64(loadConfig.jitterPercent) / 100.0) * baseLoad
-	}
-
-	// Apply peak multiplier if this is the peak second
-	if second == loadConfig.peakSecond {
-		baseLoad *= loadConfig.peakMultiplier
-	}
-
-	// Calculate final load with jitter and ensure it's not negative
-	loadWithJitter := baseLoad + jitter
-	return int(math.Max(loadWithJitter, 0))
-}
-
-type secondMetrics struct {
-	totalEvents          int
-	inferencedEvents     int
-	droppedByRateLimiter int
-	droppedByPipeline    int
-	finalRate            float64
-}
-
-type generateLoadConfig struct {
-	pattern        string
-	baseline       float64
-	jitterPercent  int
-	peakSecond     int
-	peakMultiplier float64
-
-	// Sine wave parameters
-	amplitude float64 // amplitude of sine wave
-	period    float64 // period of sine wave in seconds
-
-	// Step pattern parameters
-	stepDuration int
 }
