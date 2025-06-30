@@ -42,7 +42,7 @@ func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *rate
 			60.0,  // min rate
 			125.0, // max rate
 			5,     // adjust step
-			10,    // backoff step
+			7,     // backoff step
 
 			// 125,   // capacity (bucket size)
 			// 100.0, // initial refill rate tokens/sec
@@ -127,7 +127,7 @@ func main() {
 	simDuration := 120 // seconds
 	numPods := 6       // number of VA Pipeline pods
 	gpuMaxCapacityPerPod := 125
-	numWorkers := 75 // worker pool size
+	numWorkers := 300 // worker pool size
 	processingDelay := 120 * time.Millisecond
 
 	// Logrus setup → file + console
@@ -163,7 +163,7 @@ func main() {
 
 	newGenerateSineLoadConfig := generateLoadConfig{
 		pattern:        "sine",
-		baseline:       450.0,
+		baseline:       630.0,
 		amplitude:      150.0,
 		period:         60.0,
 		jitterPercent:  7,
