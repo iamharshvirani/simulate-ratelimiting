@@ -70,7 +70,6 @@ var predefinedConfigs = map[string]GenerateLoadConfig{
 }
 
 // GetLoadConfig returns a predefined load configuration by name.
-// If the name doesn't exist, it returns an error.
 func GetLoadConfig(name string) (GenerateLoadConfig, error) {
 	config, exists := predefinedConfigs[name]
 	if !exists {
@@ -89,14 +88,6 @@ func ListAvailableConfigs() []string {
 }
 
 func GenerateLoad(second int, loadConfig GenerateLoadConfig) int {
-	// baseLoad := loadConfig.baseline + loadConfig.amplitude*math.Sin(2*math.Pi*float64(second)/loadConfig.period)
-	// jitter := (rand.Float64() - 0.5) * (float64(loadConfig.jitterPercent) / 100.0) * baseLoad
-	// loadWithJitter := baseLoad + jitter
-	// if second == loadConfig.peakSecond {
-	// 	loadWithJitter *= loadConfig.peakMultiplier
-	// }
-	// return int(math.Max(loadWithJitter, 0))
-
 	var baseLoad float64
 
 	switch loadConfig.Pattern {
