@@ -8,96 +8,18 @@ import (
 	"math/rand"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/iamharshvirani/simulate-ratelimiting/ratelimiter"
-	"github.com/iamharshvirani/simulate-ratelimiting/utils"
+	"github.com/iamharshvirani/simulate-ratelimiting/internal/pipeline"
+	"github.com/iamharshvirani/simulate-ratelimiting/pkg/ratelimiter"
+	"github.com/iamharshvirani/simulate-ratelimiting/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
-type VAPipelinePod struct {
-	mu               sync.Mutex
-	id               string
-	capacityPerSec   int
-	processedThisSec int
-	lastTickUnix     int64
-	rateLimiter      ratelimiter.DynamicRateLimiter
-	totalProcessed   uint64 // monotonic counter for accurate metrics
-}
-
-func NewVAPipelinePod(id string, capacity int, ctx context.Context, logger *ratelimiter.SimpleLogger) *VAPipelinePod {
-	return &VAPipelinePod{
-		id:             id,
-		capacityPerSec: capacity,
-		lastTickUnix:   time.Now().Unix(),
-		rateLimiter: ratelimiter.NewDynamicRateLimiter(
-			ctx,
-			logger,
-			"pod_"+id,
-			125,   // capacity
-			125.0, // initial rate
-			60.0,  // min rate
-			125.0, // max rate
-			5,     // adjust step
-			7,     // backoff step
-		),
-	}
-}
-
-func (p *VAPipelinePod) Process() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	now := time.Now()
-	currentSecond := now.Unix()
-
-	if p.lastTickUnix != currentSecond {
-		p.lastTickUnix = currentSecond
-		p.processedThisSec = 0
-	}
-
-	if p.processedThisSec < p.capacityPerSec {
-		p.processedThisSec++
-		atomic.AddUint64(&p.totalProcessed, 1)
-		return true
-	}
-	return false
-}
-
-// GetTotalProcessed returns the monotonic processed counter.
-func (p *VAPipelinePod) GetTotalProcessed() uint64 {
-	return atomic.LoadUint64(&p.totalProcessed)
-}
-
-// PipelineCluster manages multiple VA Pipeline pods
-type PipelineCluster struct {
-	pods []*VAPipelinePod
-}
-
-func NewPipelineCluster(numPods int, capacityPerPod int, ctx context.Context, logger *ratelimiter.SimpleLogger) *PipelineCluster {
-	cluster := &PipelineCluster{
-		pods: make([]*VAPipelinePod, numPods),
-	}
-	for i := 0; i < numPods; i++ {
-		cluster.pods[i] = NewVAPipelinePod(fmt.Sprintf("pod-%d", i), capacityPerPod, ctx, logger)
-	}
-	return cluster
-}
-
-func (c *PipelineCluster) GetPod(cameraId string) *VAPipelinePod {
-	podIndex := int(cameraHash(cameraId)) % len(c.pods)
-	return c.pods[podIndex]
-}
-
-// Hash function for camera ID distribution
-func cameraHash(cameraId string) uint32 {
-	h := uint32(0)
-	for i := 0; i < len(cameraId); i++ {
-		h = h*31 + uint32(cameraId[i])
-	}
-	return h
+type requestMessage struct {
+	cameraId  string
+	timestamp time.Time
 }
 
 func main() {
@@ -139,22 +61,19 @@ func main() {
 	l.SetOutput(multiOut)
 	logger := &ratelimiter.SimpleLogger{SimpleLogger: l}
 
-	cluster := NewPipelineCluster(numPods, gpuMaxCapacityPerPod, ctx, logger)
+	cluster := pipeline.NewPipelineCluster(numPods, gpuMaxCapacityPerPod, ctx, logger)
 
 	channelBufferSize := 5000
 
-	requestChan := make(chan struct {
-		cameraId  string
-		timestamp time.Time
-		// }, numWorkers)
-	}, channelBufferSize)
+	requestChan := make(chan requestMessage, channelBufferSize)
+	// channelBufferSize -> numWorkers
 	metricsChan := make(chan utils.SecondMetrics, simDuration)
 
 	var workerWg sync.WaitGroup
 	workerWg.Add(numWorkers)
 
 	// Use predefined load configuration instead of defining it inline
-	loadConfigName := "sine_high_above_capacity"
+	loadConfigName := "sine_low"
 	loadConfig, err := utils.GetLoadConfig(loadConfigName)
 	if err != nil {
 		log.Fatalf("Error getting load configuration: %v", err)
@@ -177,8 +96,8 @@ func main() {
 					pod := cluster.GetPod(req.cameraId)
 
 					// Try to get rate limiter token
-					if !pod.rateLimiter.Wait("", 20*time.Millisecond) {
-						pod.rateLimiter.LogFailure()
+					if !pod.GetRateLimiter().Wait("", 20*time.Millisecond) {
+						pod.GetRateLimiter().LogFailure()
 						continue
 					}
 
@@ -187,10 +106,10 @@ func main() {
 
 					// Try to process on the pod
 					if pod.Process() {
-						pod.rateLimiter.LogSuccess()
+						pod.GetRateLimiter().LogSuccess()
 						time.Sleep(processingDelay + time.Duration(rand.Float64()*30)*time.Millisecond)
 					} else {
-						pod.rateLimiter.LogFailure()
+						pod.GetRateLimiter().LogFailure()
 					}
 				}
 			}
@@ -216,10 +135,8 @@ func main() {
 	log.Println("Graph generated.")
 }
 
-func runSimulation(ctx context.Context, simDuration int, loadConfig utils.GenerateLoadConfig, requestChan chan<- struct {
-	cameraId  string
-	timestamp time.Time
-}, metricsChan chan<- utils.SecondMetrics, cluster *PipelineCluster, numPods int) {
+func runSimulation(ctx context.Context, simDuration int, loadConfig utils.GenerateLoadConfig, requestChan chan<- requestMessage,
+	metricsChan chan<- utils.SecondMetrics, cluster *pipeline.PipelineCluster, numPods int) {
 	log.Println("Starting simulation...")
 	var producerWg sync.WaitGroup
 	prevTotals := make([]uint64, numPods)
@@ -249,10 +166,10 @@ func runSimulation(ctx context.Context, simDuration int, loadConfig utils.Genera
 				defer producerWg.Done()
 				for i := 0; i < numEvents; i++ {
 					cameraId := fmt.Sprintf("cam_%d", rand.Intn(250))
-					requestChan <- struct {
-						cameraId  string
-						timestamp time.Time
-					}{cameraId: cameraId, timestamp: time.Now()}
+					requestChan <- requestMessage{
+						cameraId:  cameraId,
+						timestamp: time.Now(),
+					}
 					time.Sleep(ivl)
 				}
 			}(eventsThisSecond, interval)
@@ -266,17 +183,17 @@ func runSimulation(ctx context.Context, simDuration int, loadConfig utils.Genera
 		var totalProcessed int
 		var totalRate float64
 		ratesPerPod := make([]float64, numPods)
-		for i, pod := range cluster.pods {
+		for i, pod := range cluster.GetPods() {
 			curr := pod.GetTotalProcessed()
 			delta := int(curr - prevTotals[i])
 			prevTotals[i] = curr
 
 			// Get and log rate limiter metrics for this pod
-			metrics := pod.rateLimiter.GetMetrics()
-			log.Printf("Pod %s: Processed=%d Tokens=%.2f RefillRate=%.2f", pod.id, delta, metrics.Tokens, metrics.RefillRate)
+			metrics := pod.GetRateLimiter().GetMetrics()
+			log.Printf("Pod %s: Processed=%d Tokens=%.2f RefillRate=%.2f", pod.GetId(), delta, metrics.Tokens, metrics.RefillRate)
 
 			totalProcessed += delta
-			rate := pod.rateLimiter.GetRate()
+			rate := pod.GetRateLimiter().GetRate()
 			totalRate += rate
 			ratesPerPod[i] = rate
 		}
