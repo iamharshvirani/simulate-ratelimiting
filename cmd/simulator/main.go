@@ -12,14 +12,16 @@ import (
 
 	"github.com/iamharshvirani/simulate-ratelimiting/internal/pipeline"
 	"github.com/iamharshvirani/simulate-ratelimiting/pkg/ratelimiter"
+	"github.com/iamharshvirani/simulate-ratelimiting/pkg/traffic"
 	"github.com/iamharshvirani/simulate-ratelimiting/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
 type requestMessage struct {
-	cameraId  string
-	timestamp time.Time
+	cameraId    string
+	timestamp   time.Time
+	rateLimited bool
 }
 
 func main() {
@@ -72,13 +74,40 @@ func main() {
 	var workerWg sync.WaitGroup
 	workerWg.Add(numWorkers)
 
-	// Use predefined load configuration instead of defining it inline
-	loadConfigName := "sine_low"
-	loadConfig, err := utils.GetLoadConfig(loadConfigName)
-	if err != nil {
-		log.Fatalf("Error getting load configuration: %v", err)
+	// ---------------------------------------------------------------------------
+	// Camera traffic model configuration
+	// ---------------------------------------------------------------------------
+	trafficCfg := traffic.CameraTrafficConfig{
+		TotalCameras:      viper.GetInt("cameraTraffic.totalCameras"),
+		NumGroups:         viper.GetInt("cameraTraffic.numGroups"),
+		MinRate:           viper.GetFloat64("cameraTraffic.minRate"),
+		MaxRate:           viper.GetFloat64("cameraTraffic.maxRate"),
+		DynamicMultiplier: viper.GetBool("cameraTraffic.dynamicMultiplier"),
+		PeriodSec:         viper.GetInt("cameraTraffic.periodSec"),
+		ExemptGroup:       viper.GetInt("cameraTraffic.exemptGroup"),
 	}
-	log.Printf("Using load configuration: %s", loadConfigName)
+	// sensible defaults if not provided
+	if trafficCfg.TotalCameras == 0 {
+		trafficCfg.TotalCameras = 250
+	}
+	if trafficCfg.NumGroups == 0 {
+		trafficCfg.NumGroups = 10
+	}
+	if trafficCfg.MinRate == 0 {
+		trafficCfg.MinRate = 0.5
+	}
+	if trafficCfg.MaxRate == 0 {
+		trafficCfg.MaxRate = 8
+	}
+	if trafficCfg.PeriodSec == 0 {
+		trafficCfg.PeriodSec = 60
+	}
+
+	groups, err := traffic.BuildGroups(trafficCfg)
+	if err != nil {
+		log.Fatalf("building camera groups: %v", err)
+	}
+	log.Printf("Camera traffic: %d groups, %d cameras total (exempt group = %d)", len(groups), trafficCfg.TotalCameras, trafficCfg.ExemptGroup)
 
 	for i := 0; i < numWorkers; i++ {
 		go func() {
@@ -95,21 +124,31 @@ func main() {
 					// Get the pod for this camera (simulating sticky routing)
 					pod := cluster.GetPod(req.cameraId)
 
-					// Try to get rate limiter token
-					if !pod.GetRateLimiter().Wait("", 20*time.Millisecond) {
-						pod.GetRateLimiter().LogFailure()
-						continue
+					// Token acquisition strategy: priority (non-rateLimited) vs normal
+					var acquired bool
+					if req.rateLimited {
+						// Normal cameras wait indefinitely for a token
+						acquired = pod.GetRateLimiter().Wait("", 0)
+					} else {
+						// Priority cameras: try up to one second, else drop
+						acquired = pod.GetRateLimiter().Wait("", time.Second)
 					}
 
-					// Simulate processing
-					// time.Sleep(processingDelay + time.Duration(rand.Intn(5))*time.Millisecond)
+					if !acquired {
+						pod.GetRateLimiter().LogFailure()
+						continue // drop event
+					}
 
-					// Try to process on the pod
-					if pod.Process() {
+					processed := pod.Process()
+
+					if processed {
 						pod.GetRateLimiter().LogSuccess()
-						time.Sleep(processingDelay + time.Duration(rand.Float64()*30)*time.Millisecond)
 					} else {
 						pod.GetRateLimiter().LogFailure()
+					}
+
+					if processed {
+						time.Sleep(processingDelay + time.Duration(rand.Float64()*30)*time.Millisecond)
 					}
 				}
 			}
@@ -117,7 +156,7 @@ func main() {
 	}
 
 	// Start the simulation in a separate goroutine
-	go runSimulation(ctx, simDuration, loadConfig, requestChan, metricsChan, cluster, numPods)
+	go runSimulation(ctx, simDuration, trafficCfg, groups, requestChan, metricsChan, cluster, numPods)
 
 	// Collect and plot results
 	var allMetrics []utils.SecondMetrics
@@ -135,7 +174,7 @@ func main() {
 	log.Println("Graph generated.")
 }
 
-func runSimulation(ctx context.Context, simDuration int, loadConfig utils.GenerateLoadConfig, requestChan chan<- requestMessage,
+func runSimulation(ctx context.Context, simDuration int, trafficCfg traffic.CameraTrafficConfig, groups []traffic.CameraGroup, requestChan chan<- requestMessage,
 	metricsChan chan<- utils.SecondMetrics, cluster *pipeline.PipelineCluster, numPods int) {
 	log.Println("Starting simulation...")
 	var producerWg sync.WaitGroup
@@ -154,25 +193,27 @@ func runSimulation(ctx context.Context, simDuration int, loadConfig utils.Genera
 
 		secondStart := time.Now() // precisely at wall-clock boundary
 
-		// Generate load for this second (as before)
-		eventsThisSecond := utils.GenerateLoad(t, loadConfig)
+		// Generate events for this second using the traffic generator
+		events := traffic.GenerateEventsSecond(t, trafficCfg, groups)
+		eventsThisSecond := len(events)
 
-		// Generate camera IDs and dispatch events
 		if eventsThisSecond > 0 {
-			interval := time.Second / time.Duration(eventsThisSecond+1) // +1 to avoid div-by-zero
-
+			lambda := float64(eventsThisSecond) // events per second
 			producerWg.Add(1)
-			go func(numEvents int, ivl time.Duration) {
+			go func(evts []traffic.Event, lambda float64) {
 				defer producerWg.Done()
-				for i := 0; i < numEvents; i++ {
-					cameraId := fmt.Sprintf("cam_%d", rand.Intn(250))
+				for _, e := range evts {
 					requestChan <- requestMessage{
-						cameraId:  cameraId,
-						timestamp: time.Now(),
+						cameraId:    e.CameraID,
+						timestamp:   e.Timestamp,
+						rateLimited: e.RateLimited,
 					}
-					time.Sleep(ivl)
+					if lambda > 0 {
+						gap := time.Duration(rand.ExpFloat64() / lambda * float64(time.Second))
+						time.Sleep(gap)
+					}
 				}
-			}(eventsThisSecond, interval)
+			}(events, lambda)
 		}
 
 		// Sleep until the end of this wall-clock second

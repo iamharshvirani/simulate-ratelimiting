@@ -4,3 +4,13 @@ simulation:
   gpuMaxCapacityPerPod: 125
   numWorkers: 600
   processingDelay: 750ms
+
+# New camera traffic configuration
+cameraTraffic:
+  totalCameras: 250
+  numGroups: 10
+  minRate: 0.5
+  maxRate: 5
+  dynamicMultiplier: true # Set to false for constant rate
+  periodSec: 60           # Only relevant if dynamicMultiplier is true
+  exemptGroup: 9         # Set to a group index (0-9) to exempt, or -1 for no exempt group

@@ -95,7 +95,7 @@ func (drl *dynamicRateLimiter) refill() {
 
 // Wait blocks until a token is available.
 func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) bool {
-	// start := time.Now()
+	start := time.Now()
 	for {
 		select {
 		case <-drl.ctx.Done():
@@ -105,22 +105,19 @@ func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) b
 
 		drl.mu.Lock()
 		drl.refill()
-		if drl.tokens > 0 {
+		if drl.tokens >= 1 {
 			drl.tokens--
-			if drl.tokens < 0 {
-				drl.tokens = 0
-			}
 			drl.mu.Unlock()
 			return true
 		}
 		drl.mu.Unlock()
-		time.Sleep(1 * time.Millisecond)
-		continue
 
-		// if accountType == "basic" && time.Since(start) >= timeout {
-		// 	return false
-		// }
-		// time.Sleep(10 * time.Millisecond)
+		// check timeout if requested
+		if timeout > 0 && time.Since(start) >= timeout {
+			return false
+		}
+
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -194,11 +191,6 @@ func (drl *dynamicRateLimiter) LogSuccess() {
 
 // LogFailure is called on overload (e.g., after 429 responses).
 func (drl *dynamicRateLimiter) LogFailure() {
-	// drl.mu.Lock()
-	// defer drl.mu.Unlock()
-
-	// drl.successCount = 0 // Reset success count on failure
-	// drl.failureCount++
 
 	// if drl.failureCount >= drl.failureThreshold {
 	// 	drl.reduceRate()
