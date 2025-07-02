@@ -4,6 +4,8 @@ simulation:
   gpuMaxCapacityPerPod: 125
   numWorkers: 600
   processingDelay: 750ms
+  simulationMode: "load" # Options: "traffic" (new camera traffic model) or "load" (old load generator)
+  loadConfigName: "sine_default" # Only used when simulationMode is "load"
 
 # New camera traffic configuration
 cameraTraffic:
