@@ -95,7 +95,7 @@ func (drl *dynamicRateLimiter) refill() {
 
 // Wait blocks until a token is available.
 func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) bool {
-	// start := time.Now()
+	start := time.Now()
 	for {
 		select {
 		case <-drl.ctx.Done():
@@ -105,22 +105,19 @@ func (drl *dynamicRateLimiter) Wait(accountType string, timeout time.Duration) b
 
 		drl.mu.Lock()
 		drl.refill()
-		if drl.tokens > 0 {
+		if drl.tokens >= 1 {
 			drl.tokens--
-			if drl.tokens < 0 {
-				drl.tokens = 0
-			}
 			drl.mu.Unlock()
 			return true
 		}
 		drl.mu.Unlock()
-		time.Sleep(1 * time.Millisecond)
-		continue
 
-		// if accountType == "basic" && time.Since(start) >= timeout {
-		// 	return false
-		// }
-		// time.Sleep(10 * time.Millisecond)
+		// check timeout if requested
+		if timeout > 0 && time.Since(start) >= timeout {
+			return false
+		}
+
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -164,48 +161,11 @@ func (drl *dynamicRateLimiter) LogSuccess() {
 	if drl.successCount >= drl.successThreshold {
 		drl.increaseRate()
 		drl.successCount = 0 // Reset after increasing
-
-		// if time.Since(drl.lastIncrease) >= time.Second {
-		// 	drl.increaseRate()
-		// 	drl.successCount = 0
-		// 	drl.lastIncrease = time.Now()
-		// }
 	}
-
-	// drl.mu.Lock()
-	// defer drl.mu.Unlock()
-
-	// // If there is a "failure debt", a success pays it down by one.
-	// // The system cannot begin counting successes until the debt is cleared.
-	// if drl.failureCount > 0 {
-	// 	drl.failureCount--
-	// 	drl.successCount = 0 // Ensure we don't count successes while in debt.
-	// 	return
-	// }
-
-	// // Only if there is no failure debt can we start counting successes.
-	// drl.successCount++
-
-	// if drl.successCount >= drl.successThreshold {
-	// 	drl.increaseRate()
-	// 	drl.successCount = 0 // Reset after increasing.
-	// }
 }
 
 // LogFailure is called on overload (e.g., after 429 responses).
 func (drl *dynamicRateLimiter) LogFailure() {
-	// drl.mu.Lock()
-	// defer drl.mu.Unlock()
-
-	// drl.successCount = 0 // Reset success count on failure
-	// drl.failureCount++
-
-	// if drl.failureCount >= drl.failureThreshold {
-	// 	drl.reduceRate()
-	// 	// We can keep the failure count high to prevent immediate rate increases
-	// 	// or reset it to start the count again. Let's reset it.
-	// 	// drl.failureCount = 0
-	// }
 
 	drl.mu.Lock()
 	defer drl.mu.Unlock()
@@ -219,10 +179,6 @@ func (drl *dynamicRateLimiter) LogFailure() {
 			drl.failureCount = 0
 			drl.lastDecrease = time.Now()
 		}
-		// drl.reduceRate()
-		// By NOT resetting the failureCount here, we create a "cooldown".
-		// The system now has a debt of `failureThreshold` successes that
-		// must be processed before the rate can increase again.
 	}
 }
 
